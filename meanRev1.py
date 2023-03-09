@@ -17,6 +17,7 @@
 #     <https://www.gnu.org/licenses/>.
 import asyncio
 import itertools
+import random
 
 from typing import List
 
@@ -31,13 +32,13 @@ MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 
 
 class AutoTrader(BaseAutoTrader):
-    """Example Auto-trader.
+    """First try
 
-    When it starts this auto-trader places ten-lot bid and ask orders at the
-    current best-bid and best-ask prices respectively. Thereafter, if it has
-    a long position (it has bought more lots than it has sold) it reduces its
-    bid and ask prices. Conversely, if it has a short position (it has sold
-    more lots than it has bought) then it increases its bid and ask prices.
+    Will use a pairs trading strategy to trade the two instruments. If the ASK
+    price of one is smaller than the BID price of the other, then we will order
+    the first and sell the second. If the ASK price of one is larger than the
+    BID price of the other, then we will sell the first and buy the second. The
+    transaction will be executed first on market with the lower liquidity.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, team_name: str, secret: str):
@@ -47,6 +48,7 @@ class AutoTrader(BaseAutoTrader):
         self.bids = set()
         self.asks = set()
         self.ask_id = self.ask_price = self.bid_id = self.bid_price = self.position = 0
+        self.lastETFBid = self.lastETFAsk = self.lastFUTBid = self.lastFUTAsk = 0
 
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
@@ -79,29 +81,18 @@ class AutoTrader(BaseAutoTrader):
         """
         self.logger.info("received order book for instrument %d with sequence number %d", instrument,
                          sequence_number)
-        if instrument == Instrument.FUTURE:
-            price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
-            new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
-            new_ask_price = ask_prices[0] + price_adjustment if ask_prices[0] != 0 else 0
-
-            if self.bid_id != 0 and new_bid_price not in (self.bid_price, 0):
-                self.send_cancel_order(self.bid_id)
-                self.bid_id = 0
-            if self.ask_id != 0 and new_ask_price not in (self.ask_price, 0):
-                self.send_cancel_order(self.ask_id)
-                self.ask_id = 0
-
-            if self.bid_id == 0 and new_bid_price != 0 and self.position < POSITION_LIMIT:
-                self.bid_id = next(self.order_ids)
-                self.bid_price = new_bid_price
-                self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, LOT_SIZE, Lifespan.GOOD_FOR_DAY)
-                self.bids.add(self.bid_id)
-
-            if self.ask_id == 0 and new_ask_price != 0 and self.position > -POSITION_LIMIT:
-                self.ask_id = next(self.order_ids)
-                self.ask_price = new_ask_price
-                self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, LOT_SIZE, Lifespan.GOOD_FOR_DAY)
-                self.asks.add(self.ask_id)
+        if instrument == Instrument.ETF:
+            self.lastETFAsk = ask_prices[0]
+            self.lastETFBid = bid_prices[0]
+        else:
+            self.lastFUTAsk = ask_prices[0]
+            self.lastFUTBid = bid_prices[0]
+        if self.lastETFAsk < self.lastFUTBid:  # if the ETF is cheaper than the future, buy the ETF and sell the future
+            self.bid_id = next(self.order_ids)
+            self.send_insert_order(self.bid_id, Side.BID, self.lastETFAsk, LOT_SIZE, Lifespan.F)
+        elif self.lastETFBid > self.lastFUTAsk:
+            self.ask_id = next(self.order_ids)  # if the future is cheaper than the ETF, sell the ETF and buy the future
+            self.send_insert_order(self.ask_id, Side.ASK, self.lastETFAsk, LOT_SIZE, Lifespan.F)
 
     def on_order_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your orders is filled, partially or fully.

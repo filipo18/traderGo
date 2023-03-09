@@ -37,7 +37,7 @@
   },
   "Traders": {
     "TraderOne": "secret",
-    "Trader1": "secret1",
-    "Trader2": "secret2"
+    "meanRev1": "secret1",
+    "meanRev2": "secret2"
   }
 }

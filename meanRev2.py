@@ -31,6 +31,7 @@ MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS 
 MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 
 
+# noinspection DuplicatedCode
 class AutoTrader(BaseAutoTrader):
     """First try
 
@@ -48,7 +49,7 @@ class AutoTrader(BaseAutoTrader):
         self.bids = set()
         self.asks = set()
         self.ask_id = self.ask_price = self.bid_id = self.bid_price = self.position = 0
-        self.lastETFBid = self.lastETFAsk = self.lastFUTBid = self.lastFUTAsk = 0
+        self.lastEtfBids = self.lastEtfAsks = self.lastFutureBids = self.lastFutureAsks = ((0, 0), (0, 0))
 
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
@@ -77,22 +78,31 @@ class AutoTrader(BaseAutoTrader):
         The sequence number can be used to detect missed or out-of-order
         messages. The five best available ask (i.e. sell) and bid (i.e. buy)
         prices are reported along with the volume available at each of those
-        price levels.
+        price levels
         """
         self.logger.info("received order book for instrument %d with sequence number %d", instrument,
                          sequence_number)
         if instrument == Instrument.ETF:
-            self.lastETFAsk = ask_prices[0]
-            self.lastETFBid = bid_prices[0]
+            self.lastEtfBids = tuple(zip(bid_prices, bid_volumes))
+            self.lastEtfAsks = tuple(zip(ask_prices, ask_volumes))
         else:
-            self.lastFUTAsk = ask_prices[0]
-            self.lastFUTBid = bid_prices[0]
-        if self.lastETFAsk < self.lastFUTBid:  # if the ETF is cheaper than the future, buy the ETF and sell the future
-            self.bid_id = next(self.order_ids)
-            self.send_insert_order(self.bid_id, Side.BID, self.lastETFAsk, LOT_SIZE, Lifespan.F)
-        elif self.lastETFBid > self.lastFUTAsk:
-            self.ask_id = next(self.order_ids)  # if the future is cheaper than the ETF, sell the ETF and buy the future
-            self.send_insert_order(self.ask_id, Side.ASK, self.lastETFAsk, LOT_SIZE, Lifespan.F)
+            self.lastFutureBids = tuple(zip(bid_prices, bid_volumes))
+            self.lastFutureAsks = tuple(zip(ask_prices, ask_volumes))
+
+        (etf_price, volume, side, fut_price) = self.get_max_possible_trade()
+        if etf_price != 0 and volume != 0:
+            if side == Side.ASK:
+                self.ask_price = etf_price
+                self.ask_id = next(self.order_ids)
+                self.send_insert_order(self.ask_id, side, etf_price, volume, Lifespan.F)
+                self.send_hedge_order(next(self.order_ids), Side.BID, fut_price, volume)
+            else:
+                self.bid_price = etf_price
+                self.bid_id = next(self.order_ids)
+                self.send_insert_order(self.bid_id, side, etf_price, volume, Lifespan.F)
+                self.send_hedge_order(next(self.order_ids), Side.ASK, fut_price, volume)
+
+
 
     def on_order_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your orders is filled, partially or fully.
@@ -105,10 +115,8 @@ class AutoTrader(BaseAutoTrader):
                          price, volume)
         if client_order_id in self.bids:
             self.position += volume
-            self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, volume)
         elif client_order_id in self.asks:
             self.position -= volume
-            self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
@@ -146,3 +154,33 @@ class AutoTrader(BaseAutoTrader):
         """
         self.logger.info("received trade ticks for instrument %d with sequence number %d", instrument,
                          sequence_number)
+
+    def get_max_possible_trade(self) -> (int, int, int, int):  # (price, volume, side, future_price)
+        """ Returns maximum possible trade price, volume, side for ETF using simple logic.
+
+        Logic:
+        We check what is the maximum volume at which we can buy ETF for cheaper, and sell futures for more.
+        Maximum value is found by checking every price until we find a price where we
+        can't buy ETF for cheaper
+
+        """
+        max_volume = 0
+        etf_price = 0
+        fut_price = 0
+        if self.lastEtfAsks[0][0] < self.lastFutureBids[0][0]:  # Check for trade opportunity
+            for ask in self.lastEtfAsks:  # Find max volume and limit for the trade
+                for bid in self.lastFutureBids:
+                    if ask[0] < bid[0]:
+                        max_volume += min(ask[1], bid[1])  # MISTAKE
+                        etf_price = ask[0]  # we buy by the price of ask
+                        fut_price = bid[0]  # we sell by the price of bid
+            return etf_price, max_volume, Side.BID, fut_price  # buy etf, sell fut
+        elif self.lastEtfBids[0][0] > self.lastFutureAsks[0][0]:
+            for ask in self.lastFutureAsks:
+                for bid in self.lastEtfBids:
+                    if ask[0] < bid[0]:
+                        max_volume += min(ask[1], bid[1])  # MISTAKE
+                        etf_price = bid[0]
+                        fut_price = ask[0]
+            return etf_price, max_volume, Side.ASK, fut_price  # sell etf, buy fut
+        return 0, 0, Side.BID, 0
